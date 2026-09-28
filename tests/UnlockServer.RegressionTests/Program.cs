@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -29,6 +30,11 @@ class Program
         BluetoothService.Shared.BluetoothType = 2;
         WanClient.Locks = WanClient.Unlocks = 0;
         ToastService.Last = null;
+        LocalUnlock.ClickUnlock = LocalUnlock.Available = false;
+        LocalUnlock.UnlockResult = true;
+        LocalUnlock.Requests = 0;
+        LocalUnlock.Hint = null;
+        LocalUnlock.RequestedSession = LocalUnlock.HintSession = null;
     }
     static UnlockManager Manager()
     {
@@ -48,6 +54,14 @@ class Program
     {
         Reset(); test(); Console.WriteLine("PASS " + name);
     }
+    static void WithChannels(Action<SessionUnlockChannel, SessionUnlockChannel> test)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "unlock-regression-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try { test(new SessionUnlockChannel(dir, 7), new SessionUnlockChannel(dir, 3)); }
+        finally { Directory.Delete(dir, true); }
+    }
+
     static void Main()
     {
         Test("manual unlock grace expires with no Bluetooth return", () =>
@@ -140,6 +154,106 @@ class Program
             Call(vm, "RefreshDeviceList"); Assert(vm.Devices[0].Rssi == -75, "snapshot not refreshed");
             vm.StopScanning(); vm.Dispose(); vm.Dispose();
             Assert(BluetoothService.Shared.Users == 1, "closing dialog stopped main monitor");
+        });
+        Test("RDP remains unlocked but console click targets the local lock screen", () =>
+        {
+            var manager = Manager(); Nearby();
+            manager.sessionSwitchClass.IsLocked = false;
+            LocalUnlock.Available = LocalUnlock.ClickUnlock = true;
+            Tick(manager);
+            Assert(LocalUnlock.Requests == 1 && LocalUnlock.RequestedSession == LocalUnlock.ClickSession,
+                "remote unlocked state swallowed console click or wrong target");
+            Assert(WanClient.Unlocks == 0, "console request used session-unaware remote service");
+        });
+        Test("console click still requires fresh Bluetooth", () =>
+        {
+            var manager = Manager(); Nearby();
+            BluetoothService.Shared.Devices[0].LastSeen = DateTime.Now.AddMinutes(-1);
+            LocalUnlock.Available = LocalUnlock.ClickUnlock = true; Tick(manager);
+            Assert(LocalUnlock.Requests == 0 && WanClient.Unlocks == 0 && LocalUnlock.Hint == "away" &&
+                LocalUnlock.HintSession == LocalUnlock.ClickSession, "stale Bluetooth authorized console unlock");
+        });
+        Test("console failure is returned to its session without remote fallback", () =>
+        {
+            var manager = Manager(); Nearby();
+            LocalUnlock.Available = LocalUnlock.ClickUnlock = true; LocalUnlock.UnlockResult = false;
+            Tick(manager);
+            Assert(LocalUnlock.Hint == "fail" && LocalUnlock.HintSession == LocalUnlock.ClickSession && WanClient.Unlocks == 0,
+                "failed console request was hidden or sent to remote service");
+            Tick(manager);
+            Assert(LocalUnlock.Hint == "fail", "fresh RSSI erased failure feedback");
+        });
+        Test("manual console click bypasses automatic retry cooldown", () =>
+        {
+            var manager = Manager(); Nearby(); manager.sessionSwitchClass.IsLocked = true;
+            Set(manager, "isunlockfail", true);
+            LocalUnlock.Available = LocalUnlock.ClickUnlock = true; Tick(manager);
+            Assert(LocalUnlock.Requests == 1, "automatic retry cooldown swallowed user click");
+        });
+        Test("no bound device returns feedback rather than waiting forever", () =>
+        {
+            var manager = Manager(); manager.SetBoundDevices(Array.Empty<BoundDevice>());
+            LocalUnlock.ClickUnlock = true; Tick(manager);
+            Assert(LocalUnlock.Hint == "away" && LocalUnlock.Requests == 0, "empty configuration swallowed click");
+        });
+        Test("session protocol isolates requests and consumes only fresh clicks", () =>
+        {
+            WithChannels((console, remote) =>
+            {
+                var now = DateTime.UtcNow;
+                File.WriteAllText(remote.PathFor("now"), now.Ticks.ToString());
+                Assert(!console.ConsumeClick(now) && File.Exists(remote.PathFor("now")), "stole remote session click");
+                File.WriteAllText(console.PathFor("now"), now.Ticks.ToString());
+                Assert(console.ConsumeClick(now) && !console.ConsumeClick(now), "click not consumed once");
+                foreach (var value in new[] { "garbage", "-1", long.MaxValue.ToString(), now.AddSeconds(-21).Ticks.ToString() })
+                {
+                    File.WriteAllText(console.PathFor("now"), value);
+                    Assert(!console.ConsumeClick(now), "accepted expired/future/invalid click");
+                }
+            });
+        });
+        Test("request waits for target authentication result, not remote unlocked state", () =>
+        {
+            WithChannels((console, remote) =>
+            {
+                int poll = 0;
+                bool ok = console.Request(() => { }, _ =>
+                {
+                    poll++;
+                    var token = File.ReadAllText(console.PathFor("req"));
+                    if (poll == 1) File.WriteAllText(remote.PathFor("result"), token + "|ok");
+                    if (poll == 2) File.WriteAllText(console.PathFor("result"), "old-token|ok");
+                    if (poll == 3) File.WriteAllText(console.PathFor("result"), token + "|submitted");
+                    if (poll == 4) File.WriteAllText(console.PathFor("result"), token + "|ok");
+                }, 5);
+                Assert(ok && poll == 4 && !File.Exists(console.PathFor("req")), "accepted unrelated or submitted-only result");
+            });
+        });
+        Test("concurrent requests cannot overwrite the same session token", () =>
+        {
+            WithChannels((console, remote) =>
+            {
+                bool ok = console.Request(() => { }, _ =>
+                {
+                    var token = File.ReadAllText(console.PathFor("req"));
+                    bool competing = Task.Run(() => console.Request(() => { }, __ => { }, 1)).GetAwaiter().GetResult();
+                    Assert(!competing && File.ReadAllText(console.PathFor("req")) == token,
+                        "concurrent request replaced in-flight token");
+                    File.WriteAllText(console.PathFor("result"), token + "|ok");
+                }, 1);
+                Assert(ok, "original request lost its response");
+            });
+        });
+        Test("missing response, request deletion and authentication failure are not success", () =>
+        {
+            WithChannels((console, remote) =>
+            {
+                Assert(!console.Request(() => { }, _ => File.Delete(console.PathFor("req")), 2), "deletion incorrectly confirmed authentication");
+                Assert(!console.Request(() => { }, _ => { }, 2) && !File.Exists(console.PathFor("req")), "timeout left live request");
+                Assert(!console.Request(() => { }, _ =>
+                    File.WriteAllText(console.PathFor("result"), File.ReadAllText(console.PathFor("req")) + "|fail"), 2),
+                    "authentication failure reported success");
+            });
         });
         Console.WriteLine("All regression scenarios passed (OS/Bluetooth side effects simulated).");
     }

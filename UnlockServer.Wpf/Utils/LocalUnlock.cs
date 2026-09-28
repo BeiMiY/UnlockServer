@@ -26,11 +26,13 @@ namespace UnlockServer
         private static EventWaitHandle _pulse;
 
         public static string CredPath => Path.Combine(DataDir, "local.cred");
-        public static string RequestPath => Path.Combine(DataDir, "unlock.req");
-        public static string WarnPath => Path.Combine(DataDir, "unlock.warn");
-        public static string CancelPath => Path.Combine(DataDir, "unlock.cancel");
-        public static string NowPath => Path.Combine(DataDir, "unlock.now");
-        public static string HintPath => Path.Combine(DataDir, "unlock.hint");
+        public static string RequestPath => Channel(WanClient.CurrentSessionId).PathFor("req");
+        public static string WarnPath => Channel(WanClient.CurrentSessionId).PathFor("warn");
+        public static string CancelPath => Channel(WanClient.CurrentSessionId).PathFor("cancel");
+        public static string NowPath => Channel(WanClient.CurrentSessionId).PathFor("now");
+        public static string HintPath => Channel(WanClient.CurrentSessionId).PathFor("hint");
+        private static SessionUnlockChannel Channel(uint sessionId) => new SessionUnlockChannel(DataDir, sessionId);
+
         public static string ProviderDllName = "UnlockServer.Provider.dll";
 
         public static bool IsAdministrator()
@@ -203,26 +205,19 @@ namespace UnlockServer
             return true;
         }
 
-        public static bool ConsumeUnlockNow()
+        public static bool ConsumeUnlockNow(out uint sessionId)
         {
-            if (!File.Exists(NowPath))
-                return false;
-            string raw = null;
-            try { raw = File.ReadAllText(NowPath).Trim(); }
-            catch { }
-            TryDeleteFile(NowPath);
-            if (!long.TryParse(raw, out var ticks))
-                return false;
-            var age = new TimeSpan(DateTime.UtcNow.Ticks - ticks);
-            return age.TotalSeconds >= 0 && age.TotalSeconds <= 20;
+            // 只接收当前物理控制台上的点击；远程会话不能借本机蓝牙发起登录。
+            sessionId = WanClient.WTSGetActiveConsoleSessionId();
+            return sessionId != uint.MaxValue && Channel(sessionId).ConsumeClick(DateTime.UtcNow);
         }
 
-        public static void WriteUnlockHint(string code)
+        public static void WriteUnlockHint(string code, uint? sessionId = null)
         {
             try
             {
                 Directory.CreateDirectory(DataDir);
-                File.WriteAllText(HintPath, code ?? "", Encoding.ASCII);
+                File.WriteAllText(Channel(sessionId ?? WanClient.CurrentSessionId).PathFor("hint"), code ?? "", Encoding.ASCII);
                 Pulse();
             }
             catch (Exception ex)
@@ -239,48 +234,24 @@ namespace UnlockServer
             Pulse();
         }
 
-        public static bool RequestUnlock()
+        public static bool RequestUnlock(uint? targetSessionId = null)
         {
+            var sessionId = targetSessionId ?? WanClient.CurrentSessionId;
             try
             {
-                if (!CanUnlock())
+                if (!CanUnlock() || sessionId == uint.MaxValue) return false;
+                if (targetSessionId.HasValue && sessionId != WanClient.WTSGetActiveConsoleSessionId())
                     return false;
 
-                Directory.CreateDirectory(DataDir);
-                EnsurePulseEvent();
-
-                string lastToken = null;
-                for (int i = 0; i < 40; i++)
-                {
-                    lastToken = DateTime.UtcNow.Ticks.ToString();
-                    File.WriteAllText(RequestPath, lastToken, Encoding.ASCII);
-                    Pulse();
-                    Thread.Sleep(400);
-                    if (WanClient.IsSessionLocked())
-                        continue;
-
-                    try
-                    {
-                        if (!File.Exists(RequestPath))
-                            return true;
-                        var left = File.ReadAllText(RequestPath).Trim();
-                        if (!string.Equals(left, lastToken, StringComparison.Ordinal))
-                            return true;
-                    }
-                    catch
-                    {
-                        return true;
-                    }
-
-                    LogHelper.WriteLine("会话已解锁，但锁屏组件未消费解锁请求（可能是手动登录）");
-                    return false;
-                }
-
-                return false;
+                LogHelper.WriteLine($"请求本机解锁：进程会话 {WanClient.CurrentSessionId}，目标会话 {sessionId}");
+                var ok = Channel(sessionId).Request(Pulse);
+                LogHelper.WriteLine(ok ? $"会话 {sessionId} 已确认解锁" :
+                    $"会话 {sessionId} 未确认解锁：认证失败或等待超时；请确认主程序与锁屏组件均已更新并重新加载");
+                return ok;
             }
             catch (Exception ex)
             {
-                LogHelper.WriteLine($"请求本机解锁失败: {ex.Message}");
+                LogHelper.WriteLine($"请求会话 {sessionId} 解锁失败: {ex.Message}");
                 return false;
             }
         }
@@ -373,6 +344,18 @@ namespace UnlockServer
                 TryDeleteFile(CancelPath);
                 TryDeleteFile(NowPath);
                 TryDeleteFile(HintPath);
+                if (Directory.Exists(DataDir))
+                {
+                    foreach (var file in Directory.GetFiles(DataDir, "unlock.*"))
+                    {
+                        var parts = Path.GetFileName(file).Split('.');
+                        var kind = parts[parts.Length - 1];
+                        uint session;
+                        if ((parts.Length == 2 || (parts.Length == 3 && uint.TryParse(parts[1], out session))) &&
+                            (kind == "req" || kind == "result" || kind == "now" || kind == "warn" || kind == "cancel" || kind == "hint"))
+                            TryDeleteFile(file);
+                    }
+                }
                 TryDeleteFile(Path.Combine(DataDir, "provider.log"));
 
                 var dest = GetSecureDllPath();

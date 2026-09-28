@@ -130,6 +130,7 @@
     <Compile Include="Utils\AutoStartHelper.cs" />
     <Compile Include="Utils\BluetoothDiscover.cs" />
     <Compile Include="Utils\LocalUnlock.cs" />
+    <Compile Include="Utils\SessionUnlockChannel.cs" />
     <Compile Include="Utils\LogHelper.cs" />
     <Compile Include="Utils\OperateIniFile.cs" />
     <Compile Include="Utils\SessionSwitchClass.cs" />

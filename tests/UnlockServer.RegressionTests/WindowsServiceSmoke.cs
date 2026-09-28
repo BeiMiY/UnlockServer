@@ -21,6 +21,16 @@ class WindowsServiceSmoke
         var service = BluetoothService.Shared;
         try
         {
+            // 只读核验真实 Windows 会话查询，不修改会话或登录状态。
+            var wan = typeof(BluetoothService).Assembly.GetType("UnlockServer.WanClient");
+            var query = wan.GetMethod("QuerySessionLocked", BindingFlags.Static | BindingFlags.NonPublic);
+            Check(query.Invoke(null, new object[] { uint.MaxValue }) == null,
+                "invalid console session is unknown, never interpreted as unlocked");
+            var session = (uint)wan.GetProperty("CurrentSessionId", BindingFlags.Static | BindingFlags.Public).GetValue(null);
+            Check(session == (uint)System.Diagnostics.Process.GetCurrentProcess().SessionId,
+                "session query targets the running process rather than a different console");
+            Console.WriteLine("Current session query: " + (query.Invoke(null, new object[] { session }) ?? "unknown"));
+
             // Seed a running all-types owner without starting real OS scans/timers.
             service.BluetoothType = 0;
             Set(service, "<IsScanning>k__BackingField", true);

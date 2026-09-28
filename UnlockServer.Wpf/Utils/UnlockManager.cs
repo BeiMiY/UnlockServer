@@ -154,6 +154,12 @@ namespace UnlockServer
                     _bluetooth?.NotifySessionUnlocked();
                 };
 
+                sessionSwitchClass.SessionConnectionChangedAction = () =>
+                {
+                    // 连接切换后重建扫描，避免依赖某次遗漏的锁定/解锁事件。
+                    Task.Run(() => _bluetooth?.RestartWatchers("session connection changed"));
+                };
+
                 var radio = BluetoothRadio.Default;
                 if (radio == null)
                 {
@@ -264,17 +270,16 @@ namespace UnlockServer
             lock (lockLock)
             {
                 var enabled = _bound.Where(d => d.Enabled).ToList();
-                if (enabled.Count == 0) { DismissPending(); return; }
+                if (enabled.Count == 0)
+                {
+                    DismissPending();
+                    if (LocalUnlock.ConsumeUnlockNow(out var emptySession))
+                        LocalUnlock.WriteUnlockHint("away", emptySession);
+                    return;
+                }
                 bool islocked = (sessionSwitchClass != null && sessionSwitchClass.IsLocked)
                     || WanClient.IsSessionLocked();
                 if (!islocked) isunlockfail = false;
-                if (isunlockfail)
-                {
-                    locktimecount++;
-                    if (locktimecount < 30) return;
-                    isunlockfail = false;
-                    locktimecount = 0;
-                }
                 if (_bluetooth == null) return;
 
                 var snapshot = _bluetooth.GetDevices();
@@ -395,13 +400,18 @@ namespace UnlockServer
 
                 bool clickHere = freshInRange;
 
-                if (freshInRange)
-                    LocalUnlock.ClearUnlockHint();
-
-                if (LocalUnlock.ConsumeUnlockNow())
+                if (LocalUnlock.ConsumeUnlockNow(out var targetSession))
                 {
-                    HandleClickUnlock(islocked, clickHere);
+                    HandleClickUnlock(targetSession, clickHere);
                     return;
+                }
+
+                if (isunlockfail)
+                {
+                    locktimecount++;
+                    if (locktimecount < 30) return;
+                    isunlockfail = false;
+                    locktimecount = 0;
                 }
 
                 if (_pending != PendingKind.None &&
@@ -556,22 +566,17 @@ namespace UnlockServer
             return rssi >= rssiyuzhi + half;
         }
 
-        private void HandleClickUnlock(bool islocked, bool deviceHere)
+        private void HandleClickUnlock(uint targetSession, bool deviceHere)
         {
-            if (!islocked)
-            {
-                LocalUnlock.ClearUnlockHint();
-                return;
-            }
-
+            // 点击来自物理控制台锁屏，与后台所在 RDP 会话是否锁定无关。
             if (!deviceHere)
             {
                 LogHelper.WriteLine("点击解锁：设备不在旁边");
-                LocalUnlock.WriteUnlockHint("away");
+                LocalUnlock.WriteUnlockHint("away", targetSession);
                 return;
             }
 
-            LogHelper.WriteLine("点击解锁：设备在旁边，按自动解锁处理");
+            LogHelper.WriteLine($"点击解锁：目标会话 {targetSession}，设备在旁边");
             _userCancelledUnlock = false;
             DismissPending();
             if (sessionSwitchClass != null)
@@ -579,12 +584,12 @@ namespace UnlockServer
                 sessionSwitchClass.dounlocking = true;
                 sessionSwitchClass.isLockBySoft = false;
             }
-            if (!DoUnlock())
+            if (!DoUnlock(targetSession))
             {
                 if (sessionSwitchClass != null)
                     sessionSwitchClass.dounlocking = false;
                 LogHelper.WriteLine("点击解锁失败");
-                LocalUnlock.WriteUnlockHint("fail");
+                LocalUnlock.WriteUnlockHint("fail", targetSession);
             }
         }
 
@@ -745,17 +750,20 @@ namespace UnlockServer
             LogHelper.WriteLine("已执行锁屏");
         }
 
-        private bool DoUnlock()
+        private bool DoUnlock(uint? targetSession = null)
         {
             lastUnLockTime = DateTime.Now;
             _deviceEnteredTime = null;
 
             if (useLocalUnlock && LocalUnlock.CanUnlock())
             {
-                var local = LocalUnlock.RequestUnlock();
+                var local = LocalUnlock.RequestUnlock(targetSession);
                 LogHelper.WriteLine($"本机解锁结果: {local}");
                 if (local) return true;
             }
+
+            // 旧远程服务不支持会话寻址，显式本机点击不能回退并解开错误会话。
+            if (targetSession.HasValue) return false;
 
             if (WanClient.isConfigVal())
             {

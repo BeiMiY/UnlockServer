@@ -16,5 +16,6 @@
     <Compile Include="../../UnlockServer.Wpf/Models/BoundDevice.cs" Link="BoundDevice.cs" />
     <Compile Include="PlatformDoubles.cs" />
     <Compile Include="Program.cs" />
+    <Compile Include="../../UnlockServer.Wpf/Utils/SessionUnlockChannel.cs" Link="SessionUnlockChannel.cs" />
   </ItemGroup>
 </Project>

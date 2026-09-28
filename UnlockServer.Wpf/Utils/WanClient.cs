@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace UnlockServer
@@ -252,51 +253,44 @@ namespace UnlockServer
         /// <summary>
         /// 检查会话是否已锁定
         /// </summary>
-        public static bool IsSessionLocked()
+        public static uint CurrentSessionId => (uint)Process.GetCurrentProcess().SessionId;
+
+        public static bool IsSessionLocked() => QuerySessionLocked(CurrentSessionId) ?? false;
+
+        internal static bool? QuerySessionLocked(uint sessionId)
         {
-            try
+            if (sessionId == uint.MaxValue) return null;
+            // 输入桌面属于当前进程，绝不能拿远程桌面的 Default 推断另一会话已解锁。
+            if (sessionId == CurrentSessionId)
             {
-                if (TryGetInputDesktopName(out var desktopName))
-                {
-                    if (desktopName.Equals("Winlogon", StringComparison.OrdinalIgnoreCase) ||
-                        desktopName.Equals("Disconnect", StringComparison.OrdinalIgnoreCase))
-                        return true;
-                    if (desktopName.Equals("Default", StringComparison.OrdinalIgnoreCase))
-                        return false;
-                }
-            }
-            catch { }
-
-            try
-            {
-                uint dwSessionID = WTSGetActiveConsoleSessionId();
-                uint dwBytesReturned = 0;
-                IntPtr pInfo = IntPtr.Zero;
-
-                if (!WTSQuerySessionInformationW(IntPtr.Zero, dwSessionID, WTS_INFO_CLASS.WTSSessionInfoEx, ref pInfo, ref dwBytesReturned) ||
-                    pInfo == IntPtr.Zero)
-                    return false;
-
                 try
                 {
-                    var info = Marshal.PtrToStructure<WTSINFOEXW>(pInfo);
-                    if (info.Level == 1)
+                    if (TryGetInputDesktopName(out var name))
                     {
-                        var flags = info.Data.WTSInfoExLevel1.SessionFlags;
-                        if (flags == 0) return true;
-                        if (flags == 1) return false;
+                        if (name.Equals("Winlogon", StringComparison.OrdinalIgnoreCase) ||
+                            name.Equals("Disconnect", StringComparison.OrdinalIgnoreCase)) return true;
+                        if (name.Equals("Default", StringComparison.OrdinalIgnoreCase)) return false;
                     }
                 }
-                finally
-                {
-                    WTSFreeMemory(pInfo);
-                }
+                catch { }
             }
-            catch (Exception ex)
+
+            IntPtr infoBuffer = IntPtr.Zero;
+            uint bytes = 0;
+            try
             {
-                LogHelper.WriteLine($"检查会话锁定状态失败: {ex.Message}");
+                if (!WTSQuerySessionInformationW(IntPtr.Zero, sessionId, WTS_INFO_CLASS.WTSSessionInfoEx,
+                    ref infoBuffer, ref bytes) || infoBuffer == IntPtr.Zero || bytes < Marshal.SizeOf(typeof(WTSINFOEXW)))
+                    return null;
+                var info = Marshal.PtrToStructure<WTSINFOEXW>(infoBuffer);
+                if (info.Level != 1) return null;
+                var flags = info.Data.WTSInfoExLevel1.SessionFlags;
+                if (flags == 0) return true;
+                if (flags == 1) return false;
             }
-            return false;
+            catch (Exception ex) { LogHelper.WriteLine($"检查会话 {sessionId} 锁定状态失败: {ex.Message}"); }
+            finally { if (infoBuffer != IntPtr.Zero) WTSFreeMemory(infoBuffer); }
+            return null;
         }
 
         private static bool TryGetInputDesktopName(out string name)

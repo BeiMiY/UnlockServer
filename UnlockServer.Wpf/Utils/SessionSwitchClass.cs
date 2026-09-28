@@ -17,6 +17,7 @@ namespace UnlockServer
         /// 锁屏后执行的委托
         /// </summary>
         public Action SessionLockAction { get; set; }
+        public Action SessionConnectionChangedAction { get; set; }
 
         public bool isUnlockBySoft = false;
         public bool isLockBySoft = true;
@@ -53,6 +54,15 @@ namespace UnlockServer
                     break;
                 case SessionSwitchReason.SessionLock:
                     BeginSessionLock();
+                    break;
+                case SessionSwitchReason.ConsoleConnect:
+                case SessionSwitchReason.ConsoleDisconnect:
+                case SessionSwitchReason.RemoteConnect:
+                case SessionSwitchReason.RemoteDisconnect:
+                    // 切换连接不是人工锁定/解锁，不改变用户规则和三分钟冷却。
+                    IsLocked = WanClient.IsSessionLocked();
+                    LogHelper.WriteLine($"会话连接变化: {e.Reason}, 会话 {WanClient.CurrentSessionId}");
+                    SessionConnectionChangedAction?.Invoke();
                     break;
                 case SessionSwitchReason.SessionLogoff:
                     break;

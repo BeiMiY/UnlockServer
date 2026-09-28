@@ -8,6 +8,7 @@
 #include <shlguid.h>
 #include <shlwapi.h>
 #include <new>
+#include <string>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -30,11 +31,25 @@ static const wchar_t kProviderKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Authentication\\Credential Providers\\{A31E8C27-9B14-4F6D-8E52-1C7A9D04E6B3}";
 static const wchar_t kEventName[] = L"Global\\UnlockServer.UnlockPulse";
 static const wchar_t kCredPath[] = L"C:\\ProgramData\\UnlockServer\\local.cred";
-static const wchar_t kReqPath[] = L"C:\\ProgramData\\UnlockServer\\unlock.req";
-static const wchar_t kWarnPath[] = L"C:\\ProgramData\\UnlockServer\\unlock.warn";
-static const wchar_t kCancelPath[] = L"C:\\ProgramData\\UnlockServer\\unlock.cancel";
-static const wchar_t kNowPath[] = L"C:\\ProgramData\\UnlockServer\\unlock.now";
-static const wchar_t kHintPath[] = L"C:\\ProgramData\\UnlockServer\\unlock.hint";
+static DWORD CurrentSessionId()
+{
+    DWORD id = 0xFFFFFFFF;
+    ProcessIdToSessionId(GetCurrentProcessId(), &id);
+    return id;
+}
+
+static std::wstring SessionPath(const wchar_t* kind)
+{
+    return L"C:\\ProgramData\\UnlockServer\\unlock." + std::to_wstring(CurrentSessionId()) + L"." + kind;
+}
+
+// 每个 LogonUI 只消费自身会话的指令，RDP 与物理控制台不会抢同一个文件。
+static const std::wstring kReqPath = SessionPath(L"req");
+static const std::wstring kWarnPath = SessionPath(L"warn");
+static const std::wstring kCancelPath = SessionPath(L"cancel");
+static const std::wstring kNowPath = SessionPath(L"now");
+static const std::wstring kHintPath = SessionPath(L"hint");
+static const std::wstring kResultPath = SessionPath(L"result");
 static const wchar_t kLogPath[] = L"C:\\ProgramData\\UnlockServer\\provider.log";
 
 enum FieldId { FID_TILE = 0, FID_TITLE = 1, FID_SUBTITLE = 2, FID_UNLOCK_NOW = 3, FID_CANCEL = 4, FID_COUNT = 5 };
@@ -138,10 +153,10 @@ static bool ReadUtf8File(const wchar_t* path, char* buf, DWORD bufSize)
     return read > 0;
 }
 
-static bool IsUnlockRequested()
+static bool IsUnlockRequested(unsigned long long* token = nullptr)
 {
     char raw[64] = {};
-    if (!ReadUtf8File(kReqPath, raw, sizeof(raw))) return false;
+    if (!ReadUtf8File(kReqPath.c_str(), raw, sizeof(raw))) return false;
     unsigned long long ticks = 0;
     if (sscanf_s(raw, "%llu", &ticks) != 1 || ticks == 0) return false;
 
@@ -152,8 +167,9 @@ static bool IsUnlockRequested()
     now.HighPart = ft.dwHighDateTime;
     const unsigned long long epochDiff = 504911232000000000ULL;
     unsigned long long nowTicks = now.QuadPart + epochDiff;
-    if (nowTicks < ticks) return false;
-    return (nowTicks - ticks) < 30ULL * 10000000ULL;
+    if (nowTicks < ticks || nowTicks - ticks >= 20ULL * 10000000ULL) return false;
+    if (token) *token = ticks;
+    return true;
 }
 
 static unsigned long long NowDotNetTicks()
@@ -172,7 +188,7 @@ static bool GetWarnRemain(int* seconds)
     if (!seconds) return false;
     *seconds = 0;
     char raw[64] = {};
-    if (!ReadUtf8File(kWarnPath, raw, sizeof(raw))) return false;
+    if (!ReadUtf8File(kWarnPath.c_str(), raw, sizeof(raw))) return false;
     unsigned long long ticks = 0;
     if (sscanf_s(raw, "%llu", &ticks) != 1 || ticks == 0) return false;
     unsigned long long nowTicks = NowDotNetTicks();
@@ -277,34 +293,69 @@ static void PulseUnlock()
     CloseHandle(h);
 }
 
-static const wchar_t* HintText()
+static bool WriteTextFile(const wchar_t* path, const char* text)
 {
-    char raw[32] = {};
-    if (!ReadUtf8File(kHintPath, raw, sizeof(raw))) return nullptr;
-    if (raw[0] == 'a' && raw[1] == 'w' && raw[2] == 'a' && raw[3] == 'y')
-        return L"设备不在附近";
-    if (raw[0] == 'f' && raw[1] == 'a' && raw[2] == 'i' && raw[3] == 'l')
-        return L"解锁失败";
-    return nullptr;
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    DWORD size = (DWORD)strlen(text);
+    bool ok = WriteFile(h, text, size, &written, nullptr) && written == size;
+    CloseHandle(h);
+    return ok;
 }
 
-static void WriteNowFile()
+static void WriteResult(unsigned long long token, const char* status)
 {
-    DeleteFileW(kHintPath);
-    HANDLE h = CreateFileW(kNowPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    char line[32] = {};
-    int n = sprintf_s(line, "%llu", NowDotNetTicks());
-    DWORD w = 0;
-    if (n > 0) WriteFile(h, line, (DWORD)n, &w, nullptr);
-    CloseHandle(h);
+    if (!token) return;
+    char text[64] = {};
+    sprintf_s(text, "%llu|%s", token, status);
+    WriteTextFile(kResultPath.c_str(), text);
     PulseUnlock();
+}
+
+static int HintCode()
+{
+    char raw[32] = {};
+    if (!ReadUtf8File(kHintPath.c_str(), raw, sizeof(raw))) return 0;
+    if (strcmp(raw, "away") == 0) return 1;
+    if (strcmp(raw, "fail") == 0) return 2;
+    if (strcmp(raw, "waiting") == 0) return 3;
+    if (strcmp(raw, "timeout") == 0) return 4;
+    return 0;
+}
+
+static const wchar_t* HintText()
+{
+    switch (HintCode())
+    {
+    case 1: return L"设备不在附近，请确认蓝牙已开启后重试";
+    case 2: return L"解锁失败，请检查密码与组件版本后重试";
+    case 3: return L"正在确认设备";
+    case 4: return L"等待超时，请确认后台监控已启动并更新锁屏组件";
+    default: return nullptr;
+    }
+}
+
+static bool WriteNowFile()
+{
+    // 只有物理控制台上的点击才向后台申请；不在远程锁屏触发本机蓝牙登录。
+    if (CurrentSessionId() != WTSGetActiveConsoleSessionId()) return false;
+    char line[32] = {};
+    sprintf_s(line, "%llu", NowDotNetTicks());
+    WriteTextFile(kHintPath.c_str(), "waiting");
+    if (!WriteTextFile(kNowPath.c_str(), line))
+    {
+        WriteTextFile(kHintPath.c_str(), "fail");
+        return false;
+    }
+    PulseUnlock();
+    return true;
 }
 
 static void WriteCancelFile()
 {
-    HANDLE h = CreateFileW(kCancelPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    HANDLE h = CreateFileW(kCancelPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     char line[32] = {};
@@ -312,7 +363,7 @@ static void WriteCancelFile()
     DWORD w = 0;
     if (n > 0) WriteFile(h, line, (DWORD)n, &w, nullptr);
     CloseHandle(h);
-    DeleteFileW(kWarnPath);
+    DeleteFileW(kWarnPath.c_str());
 }
 
 static bool DpapiUnprotectFile(const wchar_t* path, wchar_t* domain, wchar_t* user, wchar_t* pass, wchar_t* sid, DWORD cch)
@@ -452,7 +503,7 @@ static HRESULT RetrieveNegotiateAuthPackage(ULONG* pul)
 class UnlockCredential : public ICredentialProviderCredential2
 {
 public:
-    UnlockCredential() : _ref(1), _cpus(CPUS_INVALID), _events(nullptr)
+    UnlockCredential() : _ref(1), _cpus(CPUS_INVALID), _events(nullptr), _requestToken(0)
     {
         _sid[0] = 0;
         InterlockedIncrement(&g_dllRef);
@@ -597,12 +648,12 @@ public:
     {
         if (fid == FID_UNLOCK_NOW)
         {
-            WriteNowFile();
-            ProvLog("user requested click unlock");
+            bool requested = WriteNowFile();
+            ProvLog(requested ? "user requested console click unlock" : "click unlock rejected: not console or write failed");
             if (_events)
             {
                 _events->SetFieldString(this, FID_TITLE, L"蓝牙解锁");
-                _events->SetFieldString(this, FID_SUBTITLE, L"正在确认设备");
+                _events->SetFieldString(this, FID_SUBTITLE, requested ? L"正在确认设备" : L"请在本机锁屏上使用蓝牙解锁，并确认组件已正确安装");
             }
             return S_OK;
         }
@@ -627,9 +678,16 @@ public:
         *pcpsiOptionalStatusIcon = CPSI_NONE;
         ZeroMemory(pcpcs, sizeof(*pcpcs));
 
+        // 没有后台验证过蓝牙的新鲜请求时，即使选中磁贴也不能提交凭据。
+        unsigned long long token = 0;
+        if (!IsUnlockRequested(&token)) return S_OK;
+        _requestToken = token;
+
         wchar_t domain[256] = {}, user[256] = {}, pass[256] = {}, fileSid[128] = {};
         if (!DpapiUnprotectFile(kCredPath, domain, user, pass, fileSid, 256))
         {
+            WriteResult(token, "fail");
+            DeleteFileW(kReqPath.c_str());
             ProvLog("GetSerialization: no saved credential");
             SHStrDupW(L"Windows password is not saved.", ppszOptionalStatusText);
             *pcpsiOptionalStatusIcon = CPSI_ERROR;
@@ -644,6 +702,8 @@ public:
         SecureZeroMemory(pass, sizeof(pass));
         if (FAILED(hr))
         {
+            WriteResult(token, "fail");
+            DeleteFileW(kReqPath.c_str());
             ProvLog("GetSerialization: pack failed");
             return hr;
         }
@@ -653,6 +713,8 @@ public:
         if (FAILED(hr))
         {
             CoTaskMemFree(rgb);
+            WriteResult(token, "fail");
+            DeleteFileW(kReqPath.c_str());
             ProvLog("GetSerialization: auth package failed");
             return hr;
         }
@@ -662,7 +724,8 @@ public:
         pcpcs->rgbSerialization = rgb;
         pcpcs->clsidCredentialProvider = CLSID_UnlockServerProvider;
         *pcpgsr = CPGSR_RETURN_CREDENTIAL_FINISHED;
-        DeleteFileW(kReqPath);
+        DeleteFileW(kReqPath.c_str());
+        WriteResult(token, "submitted");
         ProvLog("GetSerialization: submitted");
         return S_OK;
     }
@@ -671,8 +734,17 @@ public:
     {
         *ppsz = nullptr;
         *icon = CPSI_NONE;
+        WriteResult(_requestToken, status == 0 ? "ok" : "fail");
+        _requestToken = 0;
         if (status != 0)
+        {
+            WriteTextFile(kHintPath.c_str(), "fail");
+            SHStrDupW(L"Windows 拒绝登录，请检查保存的账号密码。", ppsz);
+            *icon = CPSI_ERROR;
             ProvLog("ReportResult: logon failed");
+        }
+        else
+            ProvLog("ReportResult: logon succeeded");
         return S_OK;
     }
 
@@ -691,6 +763,7 @@ private:
     CREDENTIAL_PROVIDER_USAGE_SCENARIO _cpus;
     ICredentialProviderCredentialEvents* _events;
     wchar_t _sid[128];
+    unsigned long long _requestToken;
 };
 
 class UnlockProvider : public ICredentialProvider, public ICredentialProviderSetUserArray
@@ -863,6 +936,7 @@ private:
         auto* self = (UnlockProvider*)param;
         HANDLE pulse = CreatePulseEvent();
         HANDLE waits[2] = { self->_stop, pulse };
+        ULONGLONG waitingSince = 0;
         while (true)
         {
             DWORD w = WaitForMultipleObjects(pulse ? 2 : 1, waits, FALSE, 400);
@@ -895,8 +969,17 @@ private:
                     self->_cred->RefreshWarnUi();
             }
 
-            const wchar_t* hint = HintText();
-            int hintCode = hint == nullptr ? 0 : (hint[0] == L'设' ? 1 : 2);
+            int hintCode = HintCode();
+            if (hintCode == 3)
+            {
+                if (!waitingSince) waitingSince = GetTickCount64();
+                if (GetTickCount64() - waitingSince >= 25000)
+                {
+                    WriteTextFile(kHintPath.c_str(), "timeout");
+                    hintCode = 4;
+                }
+            }
+            else waitingSince = 0;
             if (self->_cred && hintCode != self->_hintCode)
             {
                 self->_hintCode = hintCode;

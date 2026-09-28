@@ -57,7 +57,7 @@ namespace UnlockServer
     public class SessionSwitchClass
     {
         public bool IsLocked, isUnlockBySoft, isLockBySoft, dolocking, dounlocking;
-        public Action SessionLockAction, SessionUnlockAction;
+        public Action SessionLockAction, SessionUnlockAction, SessionConnectionChangedAction;
         public void Close() { }
     }
     public static class WanClient
@@ -70,13 +70,26 @@ namespace UnlockServer
     }
     public static class LocalUnlock
     {
-        public static bool ClickUnlock;
-        public static bool CanUnlock() => false;
-        public static bool RequestUnlock() => true;
-        public static bool ConsumeUnlockNow() { var result = ClickUnlock; ClickUnlock = false; return result; }
+        public static bool ClickUnlock, Available, UnlockResult = true;
+        public static uint ClickSession = 7;
+        public static uint? RequestedSession, HintSession;
+        public static string Hint;
+        public static int Requests;
+        public static bool CanUnlock() => Available;
+        public static bool RequestUnlock(uint? targetSession = null)
+        {
+            Requests++;
+            RequestedSession = targetSession;
+            return UnlockResult;
+        }
+        public static bool ConsumeUnlockNow(out uint sessionId)
+        {
+            sessionId = ClickSession;
+            var result = ClickUnlock; ClickUnlock = false; return result;
+        }
         public static bool ConsumeUnlockCancel() => false;
         public static void ClearUnlockHint() { }
-        public static void WriteUnlockHint(string hint) { }
+        public static void WriteUnlockHint(string hint, uint? sessionId = null) { Hint = hint; HintSession = sessionId; }
         public static void ClearUnlockWarn() { }
         public static void WriteUnlockWarn(int seconds) { }
     }
