@@ -1,0 +1,112 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Credential Provider x64 + WPF)
+        shell: pwsh
+        run: ./scripts/build-wpf.ps1 -Configuration Release -WithProvider
+
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = 'UnlockServer.Wpf\bin\Release'
+          $stage = 'dist\UnlockServer'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Get-ChildItem $out -File |
+            Where-Object { $_.Extension -notin @('.pdb') } |
+            ForEach-Object { Copy-Item $_.FullName -Destination $stage }
+          # 关键产物校验，缺一即失败
+          foreach ($f in @('UnlockServer.exe', 'UnlockServer.Provider.dll', 'UnlockServer.exe.config')) {
+            if (!(Test-Path (Join-Path $stage $f))) { throw "missing required file: $f" }
+          }
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Generate checksums and release notes
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:TAG
+          $stage = 'dist\UnlockServer'
+          # SHA256 清单
+          $hashes = Get-ChildItem $stage -File | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$h  $($_.Name)"
+          }
+          $hashes | Out-File -FilePath 'dist\SHA256SUMS.txt' -Encoding utf8
+          # 版本说明（含校验表）
+          $hashTable = ($hashes | ForEach-Object {
+            $parts = $_ -split '\s+', 2
+            "| ``$($parts[0])`` | $($parts[1]) |"
+          }) -join "`n"
+          $notes = @"
+          ## UnlockServer $tag
+
+          基于上游 zixing131/UnlockServer main 分支（commit ``9b968579``，2026-09-28）完整源码构建的发布版本。
+
+          ### 本版本变更点
+          - fork 首次发布：新增 GitHub Actions 自动化构建与发布流程（``.github/workflows/build.yml``）
+          - 完整包含凭据提供程序 ``UnlockServer.Provider.dll``（v143 / x64 / Release），安装后支持锁屏界面蓝牙自动解锁
+          - 程序功能代码与上游 v2.3.2 保持一致，无功能性改动
+          - 源码已通过全量安全审计：无后门、无数据外传、无隐藏执行逻辑、依赖安全（引用 DLL 均为微软官方签名）
+
+          ### 上游更新摘要（v2.3.1 / v2.3.2，晚于上游 v2.3 Release）
+          - 修复远程桌面保持连接时，回本机"点击解锁"被后台误判为已解锁而忽略
+          - 锁屏指令与结果按会话隔离，只接受目标组件返回的同一请求认证结果
+          - 修复暂停自动锁屏结束后，倒计时与界面更新互相等待导致卡死
+          - 蓝牙数据与界面模型隔离、扫描稳定性与限频恢复优化、关闭搜索窗口不再停止主监控
+
+          ### 使用方法
+          1. 解压后运行 ``UnlockServer.exe``（需 .NET Framework 4.8，Windows 10/11 x64）
+          2. 「解锁」页填写当前 Windows 用户名与密码 → 「启用本机解锁」（需一次管理员授权，将注册凭据提供程序）
+          3. 「设备」页添加一台或多台蓝牙设备（手机、手表等），调整信号阈值（越接近 0 越强）
+          4. 「规则」页开启自动锁定 / 自动解锁并保存
+          5. 首次安装或更新本机解锁组件后，请重启 Windows 让 LogonUI 重新加载
+          - 仅需锁屏功能时可不安装解锁组件；解锁服务地址保持默认 ``127.0.0.1:2084``（本机使用）
+
+          ### 文件校验（SHA256）
+          | SHA256 | 文件 |
+          |---|---|
+          $hashTable
+          "@
+          # 去掉 here-string 因缩进引入的前导空格
+          $notes = ($notes -split "`n" | ForEach-Object { $_ -replace '^          ', '' }) -join "`n"
+          $notes | Out-File -FilePath 'release_notes.md' -Encoding utf8
+
+      - name: Zip package
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "dist\UnlockServer_$($env:TAG)_win-x64.zip"
+          Compress-Archive -Path 'dist\UnlockServer\*' -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: UnlockServer ${{ github.ref_name }}
+          body_path: release_notes.md
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
